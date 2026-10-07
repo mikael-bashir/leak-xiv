@@ -124,6 +124,22 @@ async def verify_full_script(code: str, target_name: str = "", target_signature:
     # answer on the certificate. A kernel-only proof and an oracle-backed one
     # both certify, but they are no longer indistinguishable downstream — the
     # certificate says which one this is instead of letting the reader assume.
+    # Jinshi/Leak axiom-closure gate (2026-10): this block used to be PURELY
+    # advisory — it computed `axioms`/`kernel_only` correctly but never failed
+    # certification on them, so a custom axiom smuggled past the textual
+    # `forbidden_violations` filter (e.g. via `Lean.addDecl (.axiomDecl ...)`
+    # from a `run_cmd`/`elab` block, which never contains the standalone word
+    # "axiom" the regex matches on) was certified `"ok": true` exactly like a
+    # legitimate native_decide-backed proof, just with a cosmetic `kernelOnly:
+    # false` note nobody downstream was required to check. Separately, the old
+    # filter `[a for a in axioms if "." in a or a.startswith("Lean")]` dropped
+    # any BARE (unnamespaced) axiom name from `axioms` entirely before this
+    # code ever saw it — so a rogue `axiom cheat : False` at the root
+    # namespace wouldn't even have shown up as non-kernel-only. Both gaps are
+    # closed below: the filter is gone, and anything outside the explicit
+    # allowlist now REFUSES certification instead of merely noting it.
+    AXIOM_ALLOWED = {"propext", "Classical.choice", "Quot.sound"}
+    AXIOM_ORACLE_PREFIXES = ("Lean.ofReduceBool", "Lean.trustCompiler")
     axioms, kernel_only = [], None
     if target_name:
         try:
@@ -131,14 +147,24 @@ async def verify_full_script(code: str, target_name: str = "", target_signature:
                                 timeout=VERIFY_TIMEOUT_S)
             for m in ax.get("messages", []) or []:
                 data = m.get("data") or ""
-                if "depends on axioms" in data or "does not depend on any axioms" in data:
-                    axioms = re.findall(r"[A-Za-z_][A-Za-z0-9_.']*", data.split(":", 1)[-1]) \
-                        if "depends on axioms" in data else []
-                    axioms = [a for a in axioms if "." in a or a.startswith("Lean")]
+                if "depends on axioms" in data:
+                    axioms = re.findall(r"[A-Za-z_][A-Za-z0-9_.']*", data.split(":", 1)[-1])
                     break
-            kernel_only = not any(
-                a.startswith(("Lean.ofReduceBool", "Lean.trustCompiler")) for a in axioms)
-        except Exception as e:  # provenance is advisory — never fail a good proof on it
+                if "does not depend on any axioms" in data:
+                    axioms = []
+                    break
+            kernel_only = not any(a.startswith(AXIOM_ORACLE_PREFIXES) for a in axioms)
+            rogue = [a for a in axioms if a not in AXIOM_ALLOWED and not a.startswith(AXIOM_ORACLE_PREFIXES)]
+            if rogue:
+                result = {
+                    "ok": False, "phase": "axiom-check", "axioms": axioms, "rogueAxioms": rogue,
+                    "report": "Certification REFUSED — the assembled proof depends on axiom(s) outside "
+                              "the standard Mathlib/Lean trust set (propext, Classical.choice, Quot.sound) "
+                              f"and the permitted native_decide oracle: {', '.join(rogue)}",
+                }
+                return json.dumps(result, ensure_ascii=False)
+        except Exception as e:  # a provenance-check FAILURE is advisory (network/timeout); a found
+            # ROGUE AXIOM above is never advisory and already returned.
             logger.warning(f"axiom provenance unavailable: {e}")
 
     note = ""
